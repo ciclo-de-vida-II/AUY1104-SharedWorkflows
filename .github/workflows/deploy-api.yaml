@@ -1,0 +1,48 @@
+name: Pipeline de Despliegue (Hito 4.1)
+
+on:
+  workflow_call:
+    # Definimos qué necesita este "manual" para funcionar
+    secrets:
+      DOCKER_USER:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # PASO 1: Descargar el código del Repo Cliente
+      - name: Checkout Cliente
+        uses: actions/checkout@v4
+
+      # PASO 2: Configurar el entorno (Node.js en este caso)
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # PASO 3: PRUEBAS (Obligatorio antes de construir)
+      - name: Instalación y Pruebas
+        run: |
+          npm install
+          npm test
+        # Si 'npm test' devuelve un error, el pipeline muere aquí.
+
+      # PASO 4: LOGIN EN DOCKER HUB
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          # Usamos los nombres exactos que tienes en GitHub Secrets
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # PASO 5: CONSTRUCCIÓN Y PUBLICACIÓN (Hito 4.1)
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Corregimos la sintaxis de la etiqueta:
+          tags: ${{ secrets.DOCKER_USER }}/techmaster-app:${{ github.ref_name }}
