@@ -1,0 +1,22 @@
+name: Validate Code Workflow
+
+on:
+  workflow_call: # Permite que sea llamado desde el cliente
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Cliente
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Build Docker Image (No Push)
+        run: |
+          docker build -t test-image:latest .
+          echo "Imagen construida exitosamente para validación."
