@@ -1,0 +1,39 @@
+name: Deploy nginx to k3s
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-nginx:
+    name: Apply nginx manifests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout SharedWorkflows
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: Copy manifests to EC2
+        run: |
+          scp -o StrictHostKeyChecking=no \
+            .github/workflows/k8s-manifests/nginx/nginx-deployment.yaml \
+            .github/workflows/k8s-manifests/nginx/nginx-service.yaml \
+            ubuntu@${{ vars.K3S_SERVER_PUBLIC_IP }}:~/
+
+      - name: Apply manifests
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@${{ vars.K3S_SERVER_PUBLIC_IP }} "
+            kubectl apply -f ~/nginx-deployment.yaml &&
+            kubectl apply -f ~/nginx-service.yaml &&
+            kubectl get pods | grep nginx
+          "
+
+      - name: Verify service
+        run: |
+          sleep 10
+          curl --retry 5 --retry-delay 5 \
+            http://${{ vars.K3S_SERVER_PUBLIC_IP }}:30080
