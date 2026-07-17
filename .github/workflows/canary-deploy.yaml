@@ -1,0 +1,260 @@
+name: Canary Deploy (receta reutilizable)
+
+# ─────────────────────────────────────────────────────────────
+# Estrategia: CANARY
+# 1) Se construye y publica la imagen con el tag de versión.
+# 2) Se despliega SOLO como canary (pocas réplicas) junto a la
+#    versión estable, bajo el mismo Service (misma etiqueta app).
+# 3) Se valida la salud del canary de forma explícita (paso
+#    independiente del rollout status): health check + latencia,
+#    ejecutado directo contra el pod canary (no depende del round
+#    robin del Service).
+# 4) Si la validación pasa -> PROMOTE: la versión estable se
+#    actualiza a la nueva imagen y el canary se apaga (scale a 0).
+# 5) Si la validación falla -> ROLLBACK AUTOMÁTICO: se apaga el
+#    canary (scale a 0) y la versión estable sigue sirviendo el
+#    100% del tráfico sin haberse tocado. No es atómico (Blue/Green
+#    sería instantáneo) pero es eficiente: solo se manipulan los
+#    pods canary.
+# ─────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Nombre lógico de la app en K8s (labels/objetos). Ej. demo-api
+        required: true
+        type: string
+      image-name:
+        description: Nombre de la imagen en Docker Hub (sin tu usuario)
+        required: true
+        type: string
+      image-tag:
+        description: Etiqueta de la versión a desplegar (ej. v1.4.0)
+        required: true
+        type: string
+      k3s-server-public-ip:
+        description: IP pública del servidor K3S
+        required: true
+        type: string
+      canary-replicas:
+        description: Réplicas del canary durante la validación (exposición controlada)
+        required: false
+        type: number
+        default: 1
+      stable-replicas:
+        description: Réplicas objetivo de la versión estable tras promover
+        required: false
+        type: number
+        default: 4
+      health-check-path:
+        description: Ruta HTTP usada para validar salud del canary
+        required: false
+        type: string
+        default: /health
+      health-check-attempts:
+        description: Cantidad de requests de validación contra el canary
+        required: false
+        type: number
+        default: 8
+      max-latency-ms:
+        description: Latencia máxima aceptada (ms) por request de validación
+        required: false
+        type: number
+        default: 800
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      EA2_SSH_PRIVATE_KEY:
+        required: true
+
+# Evita que dos despliegues del mismo app-name se pisen en el clúster
+concurrency:
+  group: canary-deploy-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── ÍTEM 1: pruebas reales antes de construir nada ──────────────────────
+  deps-and-test:
+    name: Dependencies and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar tests
+        run: npm test
+
+  # ── ÍTEM 1: build + push, con variables dinámicas (tag/versión) ────────
+  build-and-push:
+    name: Build and push Docker image
+    needs: deps-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build y push de la imagen versionada
+        run: |
+          set -euo pipefail
+          IMAGEN="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
+          docker build \
+            --build-arg APP_VERSION="${{ inputs.image-tag }}" \
+            -t "${IMAGEN}:${{ inputs.image-tag }}" \
+            .
+          docker push "${IMAGEN}:${{ inputs.image-tag }}"
+
+  # ── ÍTEM 2: desplegar SOLO el canary (exposición controlada) ───────────
+  deploy-canary:
+    name: Deploy canary (exposición controlada)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: Render de manifiestos (inyección de variables dinámicas)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/k8s-render
+          IMAGEN="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
+
+          sed \
+            -e "s|__APP_NAME__|${{ inputs.app-name }}|g" \
+            -e "s|__IMAGE__|${IMAGEN}|g" \
+            -e "s|__CANARY_TAG__|${{ inputs.image-tag }}|g" \
+            -e "s|__CANARY_REPLICAS__|${{ inputs.canary-replicas }}|g" \
+            k8s/deployment-canary.yaml > /tmp/k8s-render/deployment-canary.yaml
+
+          sed \
+            -e "s|__APP_NAME__|${{ inputs.app-name }}|g" \
+            k8s/service.yaml > /tmp/k8s-render/service.yaml
+
+      - name: Copiar manifiestos al servidor
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'mkdir -p /tmp/k8s-deploy'
+          scp -o StrictHostKeyChecking=accept-new /tmp/k8s-render/*.yaml \
+            "ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy/"
+
+      - name: Aplicar Service + Deployment canary
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" '
+            set -euo pipefail
+            sudo k3s kubectl apply -f /tmp/k8s-deploy/service.yaml
+            sudo k3s kubectl apply -f /tmp/k8s-deploy/deployment-canary.yaml
+            sudo k3s kubectl rollout status deployment/${{ inputs.app-name }}-canary --timeout=90s
+          '
+
+  # ── ÍTEM 2: "Validación de Salud" — paso EXPLÍCITO antes del 100% ──────
+  health-validation:
+    name: Validación de salud del canary
+    needs: deploy-canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: Health check + latencia contra el pod canary
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" '
+            set -euo pipefail
+            POD=$(sudo k3s kubectl get pods -l app=${{ inputs.app-name }},track=canary \
+                  -o jsonpath="{.items[0].metadata.name}")
+            echo "Validando pod canary: $POD"
+
+            FALLOS=0
+            for i in $(seq 1 ${{ inputs.health-check-attempts }}); do
+              INICIO_MS=$(date +%s%3N)
+              CODIGO=$(sudo k3s kubectl exec "$POD" -- \
+                wget -q -O /dev/null -S "http://localhost:3000${{ inputs.health-check-path }}" 2>&1 \
+                | awk "/HTTP\// {print \$2}" | tail -1)
+              FIN_MS=$(date +%s%3N)
+              LATENCIA=$((FIN_MS - INICIO_MS))
+
+              echo "Intento $i -> HTTP $CODIGO, ${LATENCIA}ms"
+
+              if [ "$CODIGO" != "200" ] || [ "$LATENCIA" -gt "${{ inputs.max-latency-ms }}" ]; then
+                FALLOS=$((FALLOS + 1))
+              fi
+            done
+
+            echo "Fallos: $FALLOS de ${{ inputs.health-check-attempts }}"
+            if [ "$FALLOS" -gt 0 ]; then
+              echo "::error::Validación de salud del canary falló ($FALLOS fallos)"
+              exit 1
+            fi
+          '
+
+  # ── ÍTEM 3a: PROMOTE — validación OK, se pasa el 100% a la nueva versión
+  promote:
+    name: Promote canary a estable
+    needs: health-validation
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: Actualizar versión estable y apagar canary
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" '
+            set -euo pipefail
+            IMAGEN="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
+
+            sudo k3s kubectl set image deployment/${{ inputs.app-name }}-stable \
+              api="${IMAGEN}:${{ inputs.image-tag }}"
+            sudo k3s kubectl scale deployment/${{ inputs.app-name }}-stable \
+              --replicas=${{ inputs.stable-replicas }}
+            sudo k3s kubectl rollout status deployment/${{ inputs.app-name }}-stable --timeout=120s
+
+            sudo k3s kubectl scale deployment/${{ inputs.app-name }}-canary --replicas=0
+
+            echo "── Estado final (promoted) ──"
+            sudo k3s kubectl get pods -l app=${{ inputs.app-name }} -o wide
+          '
+
+  # ── ÍTEM 3b: ROLLBACK AUTOMÁTICO — validación falló, se limita el daño ─
+  rollback:
+    name: Rollback automático (apagar canary)
+    needs: health-validation
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: Apagar canary — stable sigue sirviendo el 100%
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" '
+            set -euo pipefail
+            sudo k3s kubectl scale deployment/${{ inputs.app-name }}-canary --replicas=0
+
+            echo "::warning::Rollback automático ejecutado. La versión estable no fue tocada."
+            echo "── Estado final (rollback) ──"
+            sudo k3s kubectl get pods -l app=${{ inputs.app-name }} -o wide
+          '
+      - name: Marcar el job como fallido (visibilidad en el pipeline)
+        run: exit 1
