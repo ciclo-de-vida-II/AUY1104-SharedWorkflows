@@ -1,22 +1,30 @@
 name: Validate Code Workflow
 
 on:
-  workflow_call: # Permite que sea llamado desde el cliente
+  workflow_call: # Se llama desde el pipeline del cliente (ramas feature/* y fix/*)
+
+permissions:
+  contents: read
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Cliente
+      - name: Checkout cliente
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: npm install
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
 
-      - name: Run Tests
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: "Ejecutar tests (ahora reales: Jest + Supertest)"
         run: npm test
 
-      - name: Build Docker Image (No Push)
+      - name: Build de la imagen (sin push, solo validación)
         run: |
           docker build -t test-image:latest .
           echo "Imagen construida exitosamente para validación."
